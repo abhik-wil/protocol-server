@@ -1,15 +1,53 @@
-import { NextFunction, Response } from "express";
-import { RedisClient } from "./redis.utils";
-import { createAuthorizationHeader } from "./auth.utils";
-import axios from "axios";
-import logger from "./logger.utils";
-import { v4 } from "uuid";
-import { getConfig } from "./config.utils";
-import dotenv from "dotenv";
+import { Response, NextFunction } from 'express';
+import axios from 'axios';
+import { v4 } from 'uuid';
+import logger from './logger.utils';
+import { createAuthorizationHeader } from './auth.utils'; // Assuming this function exists
+import { RedisClient } from './redis.utils';
 
-dotenv.config();
 
-const redis = new RedisClient(12);
+let redis = new RedisClient(12);
+
+export async function generateTimestamp(): Promise<string> {
+    let ts = new Date();
+    ts.setSeconds(ts.getSeconds() + 1);
+    return ts.toISOString();
+}
+
+export function buildContext(reqContext: object, action: string, isBAP: boolean): object {
+    const baseContext = {
+        ...reqContext,
+        timestamp: generateTimestamp(),
+        action,
+    };
+
+    if (isBAP) {
+        return {
+            ...baseContext,
+            bap_id: process.env.BAP_ID,
+            bap_uri: process.env.BAP_URI,
+            message_id: v4(),
+        };
+    } else {
+        return {
+            ...baseContext,
+            bpp_id: process.env.BPP_ID,
+            bpp_uri: process.env.BPP_URI,
+        };
+    }
+}
+
+export async function logAndStoreRequest(key: string, requestLog: object): Promise<void> {
+    await redis.set(key, JSON.stringify(requestLog));
+}
+
+export async function makeRequest(uri: string, asyncData: object, header: string) {
+    return axios.post(uri, asyncData, {
+        headers: {
+            authorization: header,
+        },
+    });
+}
 
 export async function responseBuilder(
     res: Response,
@@ -20,170 +58,52 @@ export async function responseBuilder(
     action: string,
     error?: object | undefined
 ) {
-    let ts = new Date();
-    ts.setSeconds(ts.getSeconds() + 1);
-
-    // JSON Data that will be send to BAP/BPP
-    var async: { message: object; context?: object; error?: object } = {
+    let async: { message: object; context?: object; error?: object } = {
         context: {},
         message,
     };
 
-
-    if (action.startsWith("on_")) {
-        // Request is from BAP
-        async = {
-            ...async,
-            context: {
-                ...reqContext,
-                bpp_id: process.env.BPP_ID,
-                bpp_uri: process.env.BPP_URI,
-                timestamp: ts.toISOString(),
-                action,
-            },
-        };
-    } else {
-        // Request is from BPP
-
-        // const { bpp_uri, bpp_id, ...remainingContext } = reqContext as any;
-        async = {
-            ...async,
-            context: {
-                // ...remainingContext,
-                ...reqContext,
-                bap_id: process.env.BAP_ID,
-                bap_uri: process.env.BAP_URI,
-                timestamp: ts.toISOString(),
-                message_id: v4(),
-                action,
-            },
-        };
-    }
+    const isBAP = !action.startsWith("on_");
+    async.context = buildContext(reqContext, action, isBAP);
 
     if (error) {
-        async = { ...async, error };
+        async.error = error;
     }
 
     const header = await createAuthorizationHeader(async);
+    const transactionId = (reqContext as any).transaction_id;
 
-    if (action.startsWith("on_")) {
-        // Request is from BAP
-        var requestLog: { [k: string]: any } = {
-            request: async,
+    let requestLog: { [k: string]: any } = {
+        request: async,
+    };
+
+    try {
+        const response = await makeRequest(uri, async, header);
+        requestLog.response = {
+            timestamp: new Date().toISOString(),
+            response: response.data,
         };
-        if (action === "on_status") {
-            const transactionKeys = await redis.redis!.keys(
-                `${(async.context! as any).transaction_id}-*`
-            );
-            const logIndex = transactionKeys.filter((e) =>
-                e.includes("on_status-to-server")
-            ).length;
-
-            await redis.set(
-                `${(async.context! as any).transaction_id
-                }-${logIndex}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-        } else {
-            await redis.set(
-                `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-        }
-        try {
-            const response = await axios.post(uri, async, {
-                headers: {
-                    authorization: header,
-                },
-            });
-
-            requestLog.response = {
-                timestamp: new Date().toISOString(),
-                response: response.data,
-            };
-
-            await redis.set(
-                `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-        } catch (error) {
-            const response =
-                axios.isAxiosError(error)
-                    ? error?.response?.data
-                    : {
-                        message: {
-                            ack: {
-                                status: "NACK",
-                            },
-                        },
-                        error: {
-                            message: error,
-                        },
-                    };
-            requestLog.response = {
-                timestamp: new Date().toISOString(),
-                response: response,
-            };
-            await redis.set(
-                `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-
-            return next(error);
-        }
-    } else {
-        var requestLog: { [k: string]: any } = {
-            request: async,
+    } catch (error) {
+        requestLog.response = {
+            timestamp: new Date().toISOString(),
+            response: axios.isAxiosError(error) ? error?.response?.data : {
+                message: { ack: { status: "NACK" } },
+                error: { message: error },
+            },
         };
-        try {
-            const response = await axios.post(uri, async, {
-                headers: {
-                    authorization: header,
-                },
-            });
-
-            requestLog.response = {
-                timestamp: new Date().toISOString(),
-                response: response.data,
-            };
-
-            await redis.set(
-                `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-        } catch (error) {
-            const response =
-                axios.isAxiosError(error)
-                    ? error?.response?.data
-                    : {
-                        message: {
-                            ack: {
-                                status: "NACK",
-                            },
-                        },
-                        error: {
-                            message: error,
-                        },
-                    };
-            requestLog.response = {
-                timestamp: new Date().toISOString(),
-                response: response,
-            };
-            await redis.set(
-                `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(requestLog)
-            );
-
-            return next(error);
-        }
+        return next(error);
     }
+
+    const logKey = `${transactionId}-${action}-from-server`;
+    await logAndStoreRequest(logKey, requestLog);
 
     logger.info({
         type: "response",
         action: action,
-        transaction_id: (reqContext as any).transaction_id,
+        transaction_id: transactionId,
         message: { sync: { message: { ack: { status: "ACK" } } } },
     });
+
     return res.json({
         message: {
             ack: {
@@ -191,5 +111,4 @@ export async function responseBuilder(
             },
         },
     });
-
 }
