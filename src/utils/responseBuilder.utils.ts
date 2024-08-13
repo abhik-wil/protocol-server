@@ -5,8 +5,11 @@ import axios from "axios";
 import logger from "./logger.utils";
 import { v4 } from "uuid";
 import { getConfig } from "./config.utils";
+import dotenv from "dotenv";
 
-const redis = new RedisClient(25);
+dotenv.config();
+
+const redis = new RedisClient(12);
 
 export async function responseBuilder(
     res: Response,
@@ -15,59 +18,41 @@ export async function responseBuilder(
     message: object,
     uri: string,
     action: string,
-    domain:
-        | "b2b"
-        | "b2c"
-        | "services"
-        | "agri-services"
-        | "healthcare-service"
-        | "agri-equipment-hiring",
     error?: object | undefined
 ) {
-    res.locals = {};
     let ts = new Date();
     ts.setSeconds(ts.getSeconds() + 1);
 
+    // JSON Data that will be send to BAP/BPP
     var async: { message: object; context?: object; error?: object } = {
         context: {},
         message,
     };
 
-    // const bppURI =
-    // 	domain === "b2b"
-    // 		? B2B_BPP_MOCKSERVER_URL
-    // 		: domain === "agri-services"
-    // 		? AGRI_SERVICES_BPP_MOCKSERVER_URL
-    // 		: domain === "healthcare-service"
-    // 		? HEALTHCARE_SERVICES_BPP_MOCKSERVER_URL
-    // 		: domain === "agri-equipment-hiring"
-    // 		? AGRI_EQUIPMENT_BPP_MOCKSERVER_URL
-    // 		:domain === "b2c"? B2C_BPP_MOCKSERVER_URL
-    // 		: SERVICES_BPP_MOCKSERVER_URL;
-
-    const PORT: number = getConfig().server.port;
-    const bppURI = domain === "b2b" ? `http://localhost:${PORT}/api/b2b/bpp` : domain === "b2c" ? `http://localhost:${PORT}/api/b2c/bpp`: `http://localhost:${PORT}`;
 
     if (action.startsWith("on_")) {
+        // Request is from BAP
         async = {
             ...async,
             context: {
                 ...reqContext,
-                bpp_id: "mock.ondc.org/api",
-                bpp_uri: bppURI,
+                bpp_id: process.env.BPP_ID,
+                bpp_uri: process.env.BPP_URI,
                 timestamp: ts.toISOString(),
                 action,
             },
         };
     } else {
+        // Request is from BPP
+
         // const { bpp_uri, bpp_id, ...remainingContext } = reqContext as any;
         async = {
             ...async,
             context: {
                 // ...remainingContext,
                 ...reqContext,
-                bap_id: "mock.ondc.org/api",
-                bap_uri: bppURI,
+                bap_id: process.env.BAP_ID,
+                bap_uri: process.env.BAP_URI,
                 timestamp: ts.toISOString(),
                 message_id: v4(),
                 action,
@@ -80,8 +65,10 @@ export async function responseBuilder(
     }
 
     const header = await createAuthorizationHeader(async);
+
     if (action.startsWith("on_")) {
-        var log: { [k: string]: any } = {
+        // Request is from BAP
+        var requestLog: { [k: string]: any } = {
             request: async,
         };
         if (action === "on_status") {
@@ -95,12 +82,12 @@ export async function responseBuilder(
             await redis.set(
                 `${(async.context! as any).transaction_id
                 }-${logIndex}-${action}-from-server`,
-                JSON.stringify(log)
+                JSON.stringify(requestLog)
             );
         } else {
             await redis.set(
                 `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(log)
+                JSON.stringify(requestLog)
             );
         }
         try {
@@ -110,14 +97,14 @@ export async function responseBuilder(
                 },
             });
 
-            log.response = {
+            requestLog.response = {
                 timestamp: new Date().toISOString(),
                 response: response.data,
             };
 
             await redis.set(
                 `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(log)
+                JSON.stringify(requestLog)
             );
         } catch (error) {
             const response =
@@ -133,13 +120,58 @@ export async function responseBuilder(
                             message: error,
                         },
                     };
-            log.response = {
+            requestLog.response = {
                 timestamp: new Date().toISOString(),
                 response: response,
             };
             await redis.set(
                 `${(async.context! as any).transaction_id}-${action}-from-server`,
-                JSON.stringify(log)
+                JSON.stringify(requestLog)
+            );
+
+            return next(error);
+        }
+    } else {
+        var requestLog: { [k: string]: any } = {
+            request: async,
+        };
+        try {
+            const response = await axios.post(uri, async, {
+                headers: {
+                    authorization: header,
+                },
+            });
+
+            requestLog.response = {
+                timestamp: new Date().toISOString(),
+                response: response.data,
+            };
+
+            await redis.set(
+                `${(async.context! as any).transaction_id}-${action}-from-server`,
+                JSON.stringify(requestLog)
+            );
+        } catch (error) {
+            const response =
+                axios.isAxiosError(error)
+                    ? error?.response?.data
+                    : {
+                        message: {
+                            ack: {
+                                status: "NACK",
+                            },
+                        },
+                        error: {
+                            message: error,
+                        },
+                    };
+            requestLog.response = {
+                timestamp: new Date().toISOString(),
+                response: response,
+            };
+            await redis.set(
+                `${(async.context! as any).transaction_id}-${action}-from-server`,
+                JSON.stringify(requestLog)
             );
 
             return next(error);
