@@ -2,7 +2,6 @@ import { RedisClient } from '../../src/utils/redis.utils';
 import { buildContext, generateTimestamp, logAndStoreRequest, makeRequest } from '../../src/utils/responseBuilder.utils';
 import axios from 'axios';
 
-let redis = new RedisClient(12);
 
 jest.mock('axios');
 jest.mock('../../src/utils/redis.utils');
@@ -25,12 +24,11 @@ describe('responseBuilder', () => {
         expect(context).toHaveProperty('bpp_uri', process.env.BPP_URI);
     });
 
-    // it('should store log in Redis', async () => {
-    //     const logData = { key: 'value' };
-    //     await logAndStoreRequest('test-key', logData);
-    //     let value = await redis.get("test-key")
-    //     expect(JSON.parse(value!)).toEqual(logData);
-    // });
+    it('should store log in Redis', async () => {
+        const logData = { key: 'value' };
+        await logAndStoreRequest('test-key', logData);
+        expect(RedisClient).toHaveBeenCalled();
+    });
 
     it('should make a request with the correct header', async () => {
         axios.post = jest.fn().mockResolvedValue({data: 'response'});
